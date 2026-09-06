@@ -224,6 +224,27 @@ class PydanticFieldMeta(FieldMeta):
         result.examples = field_info.examples
         return result
 
+    @staticmethod
+    def _get_string_length_constraints(model_field: ModelField) -> Constraints:  # pyright: ignore[reportGeneralTypeIssues]
+        """Read Pydantic v1 string limits, giving field constraints precedence over model defaults.
+
+        :param model_field: The Pydantic v1 field whose limits should be resolved.
+        :returns: String or bytes length constraints; empty for other field types.
+        """
+        outer_type = unwrap_new_type(model_field.outer_type_)
+        if not is_safe_subclass(outer_type, (str, bytes)):
+            return {}
+
+        constraints = {}
+        for key, config_key in (("min_length", "min_anystr_length"), ("max_length", "max_anystr_length")):
+            field_limit = getattr(outer_type, key, getattr(model_field.field_info, key))
+            config_limit = getattr(model_field.model_config, config_key)
+            if field_limit is not None:
+                constraints[key] = field_limit
+            elif config_limit is not None and (key == "max_length" or config_limit):
+                constraints[key] = config_limit
+        return cast("Constraints", constraints)
+
     @classmethod
     def from_model_field(
         cls,
@@ -284,7 +305,10 @@ class PydanticFieldMeta(FieldMeta):
             "item_type": getattr(outer_type, "item_type", None),
         }
 
-        constraints = cast("Constraints", {**field_info_constraints, **annotation_constraints})
+        constraints = cast(
+            "Constraints",
+            {**field_info_constraints, **cls._get_string_length_constraints(model_field), **annotation_constraints},
+        )
 
         # pydantic v1 has constraints set for these values, but we generate them using faker
         if unwrap_optional(annotation) in (
@@ -314,7 +338,12 @@ class PydanticFieldMeta(FieldMeta):
         args = get_args(model_field.annotation)
         if is_optional(model_field.annotation) and len(args) == 2:  # noqa: PLR2004
             child_annotation = args[0] if args[0] is not NoneType else args[1]
-            children.append(PydanticFieldMeta.from_type(child_annotation))
+            children.append(
+                PydanticFieldMeta.from_type(
+                    child_annotation,
+                    constraints=cast("Constraints", {k: v for k, v in constraints.items() if v is not None}) or None,
+                )
+            )
         elif model_field.key_field or model_field.sub_fields:
             fields_to_iterate = (
                 ([model_field.key_field, *model_field.sub_fields])

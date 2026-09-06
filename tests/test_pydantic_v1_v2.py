@@ -61,6 +61,49 @@ def test_build(base_model: type[Union[BaseModelV1, BaseModelV2]]) -> None:
 
 
 @skip_pydantic_v1_on_py314
+@pytest.mark.parametrize("minimum,maximum", [(100, 110), (0, 3), (0, 0)])
+def test_build_v1_with_model_string_length_constraints(minimum: int, maximum: int) -> None:
+    class Foo(BaseModelV1):
+        text: str
+        binary: bytes
+        optional: Optional[str]
+        items: list[str]
+        mapping: dict[str, bytes]
+        number: int
+
+        class Config:
+            min_anystr_length = minimum
+            max_anystr_length = maximum
+
+    factory = ModelFactory.create_factory(Foo, __allow_none_optionals__=False)
+    factory.seed_random(0)
+    for result in [*factory.batch(10), *factory.coverage()]:
+        values = [result.text, result.binary, *result.items, *result.mapping, *result.mapping.values()]
+        if result.optional is not None:
+            values.append(result.optional)
+        assert all(minimum <= len(value) <= maximum for value in values)
+        assert isinstance(result.number, int)
+
+
+@skip_pydantic_v1_on_py314
+def test_build_v1_field_string_lengths_override_model_config() -> None:
+    from pydantic.v1 import Field  # noqa: PLC0415
+
+    class Foo(BaseModelV1):
+        text: str = Field(min_length=0, max_length=3)
+        binary: bytes = Field(min_length=0, max_length=3)
+
+        class Config:
+            min_anystr_length = 100
+            max_anystr_length = 110
+
+    factory = ModelFactory.create_factory(Foo)
+    for result in [*factory.batch(10), *factory.coverage()]:
+        assert len(result.text) <= 3
+        assert len(result.binary) <= 3
+
+
+@skip_pydantic_v1_on_py314
 def test_build_v1_with_constrained_fields() -> None:
     from pydantic.v1.fields import Field  # noqa: PLC0415
 

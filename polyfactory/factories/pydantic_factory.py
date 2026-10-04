@@ -4,6 +4,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import suppress
 from datetime import timezone
+from enum import EnumMeta
 from functools import partial
 from os.path import realpath
 from pathlib import Path
@@ -16,7 +17,7 @@ from polyfactory.exceptions import MissingDependencyException
 from polyfactory.factories.base import BaseFactory, BuildContext
 from polyfactory.factories.base import BuildContext as BaseBuildContext
 from polyfactory.field_meta import Constraints, FieldMeta, Null
-from polyfactory.utils.helpers import unwrap_new_type, unwrap_optional
+from polyfactory.utils.helpers import unwrap_annotation, unwrap_new_type, unwrap_optional
 from polyfactory.utils.model_coverage import CoverageContainer
 from polyfactory.utils.normalize_type import normalize_type
 from polyfactory.utils.predicates import is_annotated, is_optional, is_safe_subclass, is_union
@@ -261,18 +262,22 @@ class PydanticFieldMeta(FieldMeta):
             annotation_metadata = cls.get_constraints_metadata(model_field.annotation)
             annotation_constraints = cls.parse_constraints(annotation_metadata) if annotation_metadata else {}
 
+        min_length = getattr(outer_type, "min_length", model_field.field_info.min_length)
+        max_length = getattr(outer_type, "max_length", model_field.field_info.max_length)
         field_info_constraints = {
             "ge": getattr(outer_type, "ge", model_field.field_info.ge),
             "gt": getattr(outer_type, "gt", model_field.field_info.gt),
             "le": getattr(outer_type, "le", model_field.field_info.le),
             "lt": getattr(outer_type, "lt", model_field.field_info.lt),
             "min_length": (
-                getattr(outer_type, "min_length", model_field.field_info.min_length)
-                or getattr(outer_type, "min_items", model_field.field_info.min_items)
+                min_length
+                if min_length is not None
+                else getattr(outer_type, "min_items", model_field.field_info.min_items)
             ),
             "max_length": (
-                getattr(outer_type, "max_length", model_field.field_info.max_length)
-                or getattr(outer_type, "max_items", model_field.field_info.max_items)
+                max_length
+                if max_length is not None
+                else getattr(outer_type, "max_items", model_field.field_info.max_items)
             ),
             "pattern": getattr(outer_type, "regex", model_field.field_info.regex),
             "unique_items": getattr(outer_type, "unique_items", model_field.field_info.unique_items),
@@ -461,7 +466,49 @@ class ModelFactory(BaseFactory[T], Generic[T]):
                     )
                     for field_name, field_info in cls.__model__.model_fields.items()  # pyright: ignore[reportGeneralTypeIssues]
                 ]
+            is_v1 = _is_pydantic_v1_model(cls.__model__)
+            if is_v1:
+                config = cls.__model__.__config__  # type: ignore[attr-defined]
+                length_constraints = {
+                    "min_length": config.min_anystr_length,
+                    "max_length": config.max_anystr_length,
+                }
+            else:
+                length_constraints = {
+                    "min_length": cls.__model__.model_config.get("str_min_length"),
+                    "max_length": cls.__model__.model_config.get("str_max_length"),
+                }
+            for field_meta in cls._fields_metadata:
+                cls._apply_model_length_constraints(field_meta, length_constraints, is_v1=is_v1)
         return cls._fields_metadata
+
+    @classmethod
+    def _apply_model_length_constraints(
+        cls, field_meta: FieldMeta, length_constraints: Mapping[str, int | None], *, is_v1: bool
+    ) -> None:
+        """Apply model string defaults without overriding field bounds or container lengths.
+
+        :param field_meta: The field metadata, including its child annotations.
+        :param length_constraints: Default minimum and maximum string lengths.
+        :param is_v1: Whether Pydantic v1's defaults also apply to bytes.
+        """
+        annotation = unwrap_annotation(field_meta.annotation)
+        if is_v1:
+            supports_defaults = (
+                is_safe_subclass(annotation, (str, bytes, pydantic_v1.SecretStr, pydantic_v1.SecretBytes))
+                and not is_safe_subclass(annotation, (pydantic_v1.AnyUrl, pydantic_v1.EmailStr))
+                and not isinstance(annotation, EnumMeta)
+            )
+        else:
+            supports_defaults = annotation is str or is_safe_subclass(annotation, SecretStr)
+        if supports_defaults:
+            for key, value in length_constraints.items():
+                if value is not None and (key == "max_length" or value):
+                    constraints = dict(field_meta.constraints or {})
+                    constraints.setdefault(key, value)
+                    field_meta.constraints = cast("Constraints", constraints)
+        for child in field_meta.children or []:
+            cls._apply_model_length_constraints(child, length_constraints, is_v1=is_v1)
 
     @classmethod
     def get_constrained_field_value(
@@ -479,6 +526,10 @@ class ModelFactory(BaseFactory[T], Generic[T]):
             )
             return to_json(value)  # pyright: ignore[reportPossiblyUnboundVariable]
 
+        if is_safe_subclass(annotation, (SecretStr, pydantic_v1.SecretStr)):
+            annotation = str
+        elif is_safe_subclass(annotation, (SecretBytes, pydantic_v1.SecretBytes)):
+            annotation = bytes
         return super().get_constrained_field_value(
             annotation, field_meta, field_build_parameters=field_build_parameters, build_context=build_context
         )
